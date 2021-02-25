@@ -1,7 +1,7 @@
 const express = require('express');
-const JSONdb = require('simple-json-db');
+const AWS = require('aws-sdk')
+AWS.config.logger = console;
 
-const db = new JSONdb('./database.json');
 const app = express();
 
 const BAD_CLIMATES = ['fail', 'failed', 'failing', 'failure', 'no'];
@@ -9,7 +9,18 @@ const GOOD_CLIMATES = ['ok', 'succeed', 'succeeded', 'pass', 'passed', 'passing'
 
 const CLIMATE_COLORS = ['red', 'orange', 'yellow', 'yellowgreen', 'green', 'brightgreen'];
 
-app.get('/new-badge', function (req, res) {
+AWS.config.update({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+});
+
+const s3 = new AWS.S3({
+  params: {
+    Bucket: process.env.BUCKET,
+  },
+});
+
+app.get('/badge', async function (req, res) {
   let key;
   let range = [0, 100];
   const badge = {};
@@ -20,55 +31,85 @@ app.get('/new-badge', function (req, res) {
     if (!req.query.color) {
       badge.color = 'lightgrey';
 
-      if (req.query.climate) {
-        if (isNaN(req.query.message.replace(/%$/, ''))) {
-          const normalized =  badge.message.toLowerCase();
+      if (req.query.climate === 'KEYWORD') {
+        const normalized =  badge.message.toLowerCase();
 
-          if (BAD_CLIMATES.includes(normalized)) {
-            badge.color = 'red';
-          }
+        if (BAD_CLIMATES.includes(normalized)) {
+          badge.color = 'red';
+        }
 
-          if (GOOD_CLIMATES.includes(normalized)) {
-            badge.color = 'brightgreen';
-          }
+        if (GOOD_CLIMATES.includes(normalized)) {
+          badge.color = 'brightgreen';
+        }
 
+      } else if (req.query.climate === 'RANGE' && !isNaN(req.query.message.replace(/%$/, ''))) {
+
+        const number = parseFloat(req.query.message);
+
+        if (req.query.range && req.query.range.match(/-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)/)) {
+          range = req.query.range.split(',').map((num) => parseFloat(num));
+        }
+
+        let colors = CLIMATE_COLORS;
+        if ((range[1] - range[0]) < 0) {
+          colors = colors.reverse();
+        }
+
+        const position = Math.min(Math.max(number / Math.abs(range[1] - range[0]), 0), 1);
+        const colorIndex = Math.round((colors.length - 1) * position);
+        badge.color = colors[colorIndex];
+
+      } else if (req.query.climate === 'ZERO_OR_ERROR') {
+
+        if (parseInt(req.query.message) === 0) {
+          badge.color = 'brightgreen';
         } else {
-          const number = parseFloat(req.query.message);
+          badge.color = 'red';
+        }
 
-          if (req.query.range && req.query.range.match(/-?[0-9]+(\.[0-9]+)?,-?[0-9]+(\.[0-9]+)/)) {
-            range = req.query.range.split(',').map((num) => parseFloat(num));
-          }
+      } else if (req.query.climate === 'ZERO_OR_WARNING') {
 
-          let colors = CLIMATE_COLORS;
-          if ((range[1] - range[0]) < 0) {
-            colors = colors.reverse();
-          }
-
-          const position = Math.min(Math.max(number / Math.abs(range[1] - range[0]), 0), 1);
-          const colorIndex = Math.round((colors.length - 1) * position);
-          badge.color = colors[colorIndex];
+        if (parseInt(req.query.message) === 0) {
+          badge.color = 'brightgreen';
+        } else {
+          badge.color = 'yellow';
         }
 
       }
+
     } else {
       badge.color = req.query.color;
     }
 
-    db.set(key, badge);
-    res.send('OK');
+    try {
+      await s3.putObject({
+        Key: process.env.S3_PREFIX + key + '.json',
+        Body: JSON.stringify(badge),
+        ContentType: 'application/json',
+      }).promise();
+      res.send('OK');
+    } catch (err) {
+      console.error(err);
+      res.status(500).send('Fail to save data on S3');
+    }
 
   } else {
-    res.statusCode(500).send('Fail');
+    res.status(400).send('Invalid');
   }
 });
 
 
-app.get('/badge/:key.svg', function (req, res) {
-  const badge = db.get(req.params.key);
-  if (badge) {
+app.get('/badge/:key.svg', async function (req, res) {
+
+  try {
+    const data = await s3.getObject({
+      Key: process.env.S3_PREFIX + req.params.key + '.json',
+    }).promise();
+    const badge = JSON.parse(data.Body.toString());
     res.redirect(`https://img.shields.io/badge/${badge.label}-${badge.message}-${badge.color}`);
-  } else {
-    res.statusCode(404).send('Not found');
+  } catch (err) {
+    console.error(err);
+    res.status(404).send('Not found');
   }
 });
 
